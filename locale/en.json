@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Read-only mode",
+    "description": "Adds a Read-only switch to the right side of the composer. While it is on, the session only runs read operations: every write, command execution, delegation and generation call is denied until the switch is turned off."
+  }
+}

@@ -1,0 +1,3 @@
+- insert:
+    - id: dsh-readonly-mode
+      name: '@local/dsh-readonly-mode'
