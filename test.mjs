@@ -25,6 +25,8 @@ let rpcHandler;
 let rpcChannel;
 
 const hostScope = {
+  // `connection` is reachable through the fiber scope in current builds and through
+  // root in older ones; the plugin must accept either.
   root: {
     connection: {
       rpc: {
@@ -89,6 +91,7 @@ check('rpc get other session', await rpcHandler('get', { sessionId: 's2' }), {
   ok: true,
   value: { sessionId: 's2', active: false },
 });
+check('rpc ping', (await rpcHandler('ping', {})).ok, true);
 
 check('armed: read allowed', call('read', 's1'), undefined);
 check('armed: grep allowed', call('grep', 's1'), undefined);
@@ -113,6 +116,12 @@ check('armed: blender_viewport status allowed', call('blender_viewport', 's1', {
 check('armed: blender_viewport start denied', typeof call('blender_viewport', 's1', { op: 'start' }), 'string');
 check('armed: deny message mentions tool', call('write', 's1').includes('"write"'), true);
 
+// Session shapes other than agent.session.header.id must still resolve.
+const execWithoutAgent = { name: 'write', arguments: {}, session: { header: { id: 's1' } } };
+check('denied via session.header.id fallback', typeof guard(execWithoutAgent), 'string');
+const execWithSessionId = { name: 'write', arguments: {}, sessionId: 's1' };
+check('denied via sessionId fallback', typeof guard(execWithSessionId), 'string');
+
 check('rpc set off', await rpcHandler('set', { sessionId: 's1', active: false }), {
   ok: true,
   value: { sessionId: 's1', active: false },
@@ -130,6 +139,8 @@ check('command status after on', run('status').text.includes('已开启'), true)
 check('command toggle', run('toggle').text.includes('已关闭'), true);
 check('command bad word', run('wat').kind, 'error');
 check('command no session', cmd.handler({ rawInput: 'on', agent: {} }).kind, 'error');
+check('command text carries token on', /readonly=on/.test(run('on').text), true);
+check('command text carries token off', /readonly=off/.test(run('off').text), true);
 
 /* ---------------- client half ---------------- */
 let clientDef;
@@ -151,64 +162,156 @@ globalThis.document = {
 await import(pkgUrl('client.js'));
 check('client module id', clientDef?.id, '@local/dsh-readonly-mode');
 
-check('react was not required at load time', typeof clientDef.factory, 'function');
-
-const registered = [];
-const localeRegistered = [];
-const bindCalls = [];
-const clientCtx = {
-  get(name) {
-    return name === 'connection' ? { rpc: { call: async () => ({ ok: true, value: { active: false } }) } } : undefined;
-  },
-  effect(fn) {
-    return fn();
-  },
-  locale: {
-    register(ns, dicts) {
-      localeRegistered.push([ns, Object.keys(dicts)]);
-      return Promise.resolve();
-    },
-    bind(ns) {
-      return (key) => {
-        bindCalls.push(key);
-        return key;
-      };
-    },
-  },
-  slots: {
-    inject(root, factory) {
-      check('client slot root', root, 'conversation.input.right');
-      factory();
-    },
-    register(options, component) {
-      registered.push({ options, component });
-    },
-  },
-};
-
-const clientModule = clientDef.factory((specifier) => {
-  if (specifier !== 'react') throw new Error(`unexpected require(${specifier})`);
-  return {
-    createElement: (type, props, ...children) => ({ type, props, children }),
-    useState: (initial) => [initial, () => {}],
-    useEffect: () => {},
+/** Minimal hook runtime: hook slots persist across renders, effects flush on demand. */
+function makeReactRuntime() {
+  const runtime = {
+    cursor: 0,
+    values: [],
+    effects: [],
   };
+  runtime.api = {
+    createElement(type, props, ...children) {
+      return { type, props: props ?? {}, children };
+    },
+    useState(initial) {
+      const index = runtime.cursor;
+      runtime.cursor += 1;
+      if (!(index in runtime.values)) runtime.values[index] = initial;
+      const set = (next) => {
+        runtime.values[index] = typeof next === 'function' ? next(runtime.values[index]) : next;
+      };
+      return [runtime.values[index], set];
+    },
+    useEffect(fn) {
+      runtime.effects.push(fn);
+    },
+  };
+  runtime.render = (component, props) => {
+    runtime.cursor = 0;
+    runtime.effects.length = 0;
+    return component(props);
+  };
+  runtime.flush = () => runtime.effects.splice(0).map((fn) => fn());
+  return runtime;
+}
+
+/** Mount the client half against a fake context and return what it registered. */
+async function mountClient(get) {
+  const registered = [];
+  const localeRegistered = [];
+  const ctx = {
+    get,
+    effect(fn) {
+      return fn();
+    },
+    locale: {
+      register(ns, dicts) {
+        localeRegistered.push([ns, Object.keys(dicts)]);
+        return Promise.resolve();
+      },
+      bind() {
+        return (key) => key;
+      },
+    },
+    slots: {
+      inject(root, factory) {
+        check('client slot root', root, 'conversation.input.right');
+        factory();
+      },
+      register(options, component) {
+        registered.push({ options, component });
+      },
+    },
+  };
+  const runtime = makeReactRuntime();
+  const module = clientDef.factory((specifier) => {
+    if (specifier !== 'react') throw new Error(`unexpected require(${specifier})`);
+    return runtime.api;
+  });
+  module.apply(ctx);
+  return { module, registered, localeRegistered, runtime };
+}
+
+/* --- scenario A: the package RPC channel answers --- */
+const rpcCalls = [];
+const scenarioA = await mountClient((name) =>
+  name === 'connection'
+    ? {
+        rpc: {
+          async call(channel, endpoint, payload) {
+            rpcCalls.push([channel, endpoint, payload]);
+            return { ok: true, value: { sessionId: payload.sessionId, active: endpoint === 'get' } };
+          },
+        },
+      }
+    : undefined,
+);
+
+check('client inject list', scenarioA.module.inject, ['slots', 'locale']);
+check('locale namespace', scenarioA.localeRegistered, [['readonly-mode', ['zh', 'en']]]);
+check('style tagged', styleNodes[0].dataset.plugin, 'dsh-readonly-mode');
+check('slot name', scenarioA.registered[0].options.name, 'conversation.input.right');
+check('slot id', scenarioA.registered[0].options.id, 'readonly-mode');
+check('slot order', scenarioA.registered[0].options.order, 20);
+check('slot props carry sessionId', scenarioA.registered[0].options.inject('s1').sessionId, 's1');
+check('slot props are only the session', Object.keys(scenarioA.registered[0].options.inject('s1')), ['sessionId']);
+
+const toggleA = scenarioA.registered[0].component;
+const elementA = scenarioA.runtime.render(toggleA, { sessionId: 's1' });
+check('button element type', elementA.type, 'button');
+check('button starts disabled while loading', elementA.props.disabled, true);
+scenarioA.runtime.flush();
+await new Promise((resolve) => setTimeout(resolve, 0));
+check('rpc get used on mount', rpcCalls[0], [host.CHANNEL, 'get', { sessionId: 's1' }]);
+check('state settled to on', scenarioA.runtime.values[0], true);
+check('phase settled to ready', scenarioA.runtime.values[1], 'ready');
+
+scenarioA.runtime.render(toggleA, {});
+scenarioA.runtime.flush();
+const noSession = scenarioA.runtime.render(toggleA, {});
+check('button rendered without a session id too', noSession.type, 'button');
+check('without a session id it is not armed', noSession.props['data-readonly-mode'], 'off');
+
+/* --- scenario B: no RPC channel, the /readonly command carries the state --- */
+const commandCalls = [];
+const scenarioB = await mountClient((name) => {
+  if (name === 'remote') {
+    return {
+      commands: {
+        async execute(sessionId, line) {
+          commandCalls.push([sessionId, line]);
+          const on = line !== '/readonly off';
+          return { ok: true, value: { kind: 'success', text: on ? '已开启。readonly=on' : '已关闭。readonly=off' } };
+        },
+      },
+    };
+  }
+  return undefined;
 });
 
-check('client inject list', clientModule.inject, ['slots', 'locale', 'connection']);
-clientModule.apply(clientCtx);
+const toggleB = scenarioB.registered[0].component;
+const elementB = scenarioB.runtime.render(toggleB, { sessionId: 's7' });
+check('fallback: button visible', elementB.type, 'button');
+scenarioB.runtime.flush();
+await new Promise((resolve) => setTimeout(resolve, 0));
+check('fallback read used the command', commandCalls[0], ['s7', '/readonly status']);
+check('fallback parsed on', scenarioB.runtime.values[0], true);
 
-check('locale namespace', localeRegistered, [['readonly-mode', ['zh', 'en']]]);
-check('style injected', styleNodes.length, 1);
-check('style tagged', styleNodes[0].dataset.plugin, 'dsh-readonly-mode');
-check('slot registered once', registered.length, 1);
-check('slot name', registered[0].options.name, 'conversation.input.right');
-check('slot id', registered[0].options.id, 'readonly-mode');
-check('slot order', registered[0].options.order, 20);
-check('component is function', typeof registered[0].component, 'function');
-check('slot props carry sessionId', registered[0].options.inject('s1').sessionId, 's1');
-check('slot props carry translator', typeof registered[0].options.inject('s1').t, 'function');
-check('translator has fallback', clientCtx.locale.bind('x')('label'), 'label');
+// A second render is what React does after the state update; its click closure
+// then sees the settled phase instead of the initial "loading".
+const elementB2 = scenarioB.runtime.render(toggleB, { sessionId: 's7' });
+check('settled button is enabled', elementB2.props.disabled, false);
+elementB2.props.onClick();
+await new Promise((resolve) => setTimeout(resolve, 0));
+check('fallback write used the command', commandCalls[1], ['s7', '/readonly off']);
+
+/* --- scenario C: no transport at all --- */
+const scenarioC = await mountClient(() => undefined);
+const elementC = scenarioC.runtime.render(scenarioC.registered[0].component, { sessionId: 's3' });
+scenarioC.runtime.flush();
+await new Promise((resolve) => setTimeout(resolve, 0));
+check('no transport still renders', elementC.type, 'button');
+check('no transport lands in error', scenarioC.runtime.values[1], 'error');
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

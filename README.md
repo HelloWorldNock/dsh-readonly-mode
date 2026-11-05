@@ -17,7 +17,9 @@ Per-session read-only switch for the DSH chat composer. While armed, every tool 
 - **按会话生效**：状态以会话 ID 为键，别的会话不受影响。
 - **拒绝在工具执行前发生**：模型收到明确的拒绝原因（中英双语），并被告知请你关闭开关，而不是拿到一个静默失败。
 - **委派一并拦住**：`subagent`、`workflow` 不在放行表内，只读会话无法通过子会话绕回写入。
-- **开关只能由用户操作**：界面通过包内 RPC 读写状态，模型侧没有任何工具能打开或关闭它。
+- **开关只能由用户操作**：界面通过 `/readonly` 命令读写状态，模型侧没有任何工具能打开或关闭它。
+- **不依赖单一通道**：优先走命令；若构建里能拿到 `connection.rpc`，包内 RPC 通道会自动启用并优先使用。宿主换版本导致其中一条路断掉时，开关不会变成死按钮。
+- **可诊断**：宿主把启动、通道注册结果、拦截记录追加到系统临时目录的 `dsh-readonly-mode.log`，出问题时先看这个文件。
 
 ## 安装
 
@@ -61,8 +63,8 @@ plugin_manager action=install_bundle target="<本仓库目录的绝对路径>"
 
 | 环节 | 做法 | 依赖的宿主契约 |
 | --- | --- | --- |
-| 状态 | 宿主进程内存里的 `Set<sessionId>`，由包内 RPC 通道 `/dsh-readonly-mode` 的 `get` / `set` / `list` 读写 | `connection.rpc.handle` · `connection.rpc.call` |
-| 开关 | 注册进 `conversation.input.right` 槽，`inject: (sessionId) => ({ sessionId, t })` | `slots.register` |
+| 状态 | 宿主进程内存里的 `Set<sessionId>`；界面通过 `/readonly status|on|off` 命令（`ctx.remote.commands.execute`）读写，命令输出带 `readonly=on\|off` 标记供解析。包内 RPC 通道 `/dsh-readonly-mode` 在能拿到 `connection.rpc` 的构建上作为备选 | `remote.commands.execute` · `connection.rpc.handle/call` |
+| 开关 | 注册进 `conversation.input.right` 槽，`inject: (sessionId) => ({ sessionId })`；客户端只硬依赖 `slots` 与 `locale`，其余服务按需懒取 | `slots.register` |
 | 拦截 | `ctx.tools.guard(fn)` 全局守卫：按 `execution.agent.session.header.id` 查表，不在放行表内就返回拒绝原因 | `ToolGuard = (execution) => string \| undefined` |
 | 命令 | `ctx.commands.register({ name: 'readonly', recordInput: false, handler })` | `CommandDefinition` |
 | 文案 | `ctx.locale.register('readonly-mode', { zh, en })`，slot 内 `t()` 本地化 | Client locale 服务 |
@@ -76,7 +78,13 @@ plugin_manager action=install_bundle target="<本仓库目录的绝对路径>"
 - 拒绝以工具错误返回给模型，模型可能换个写法重试——仍然会被拒绝，但会多花一轮。
 - `univer_screenshot` 与 `blender_rt_see` 会把 PNG 写到磁盘，是为了让模型「看」而保留的例外（产物在临时/输出目录）。
 - 与 permission preset 是叠加关系：preset 是部署级，本插件是会话级，两者不互相替代。
-- 依赖 DSH `0.2.1-rc.5` 的契约（slots / commands / rpc / `tools.guard`）。宿主升级后接口若有变化，需要同步调整。
+- 依赖 DSH 的契约（slots / commands / `remote.commands` / `tools.guard`）。已在 `0.2.2-rc.1` 上跑通；宿主升级后接口若有变化，需要同步调整。
+- 桌面版 `0.2.2-rc.1` 里第三方插件拿不到 `connection.rpc`（注册时报 `cannot get property "webServer" without inject`），所以包内 RPC 通道在这类构建上会被跳过，界面改走命令通道。日志里能看到这一行，属预期。
+
+## 变更记录
+
+- **0.2.0** — 适配 DSH `0.2.2-rc.1`。失效原因是界面侧状态读取走的那条通道在该构建里不可用：客户端硬注入 `connection`（拿不到时整个客户端半边不挂载），且宿主侧 `connection.rpc.handle` 直接抛 `cannot get property "webServer" without inject`。现在：客户端只硬依赖 `slots` 与 `locale`；状态读写改走 `/readonly` 命令（命令输出带 `readonly=on|off` 机器可读标记），RPC 通道降为备选；会话 ID 解析补了多种形状兜底；新增宿主侧诊断日志。
+- **0.1.0** — 首版：全局工具守卫 + 输入框右侧锁形开关 + `/readonly` 命令。
 
 ## 自测
 

@@ -1,7 +1,7 @@
 /**
  * Read-only mode — Host half.
  *
- * The switch is per session and lives in memory (Map/Set keyed by session id).
+ * The switch is per session and lives in memory (Set keyed by session id).
  * Enforcement is a plugin-wide `ctx.tools.guard()`: it runs for every tool call,
  * so flipping the switch takes effect on the very next call, and because a guard
  * has no "allow" result it cannot be overridden by listener ordering.
@@ -9,7 +9,14 @@
  * Classification is fail-closed: only tools on the read allowlist below run while
  * the switch is on. Anything not proven to be a read is denied, which is the only
  * way to honour "不进行任何写入操作" without silently leaking new writer tools.
+ *
+ * The Client half reaches this state either through the package RPC channel below
+ * or through the `/readonly` command; both paths write to the same registry.
  */
+
+import { appendFileSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 export const name = 'dsh-readonly-mode'
 
@@ -18,9 +25,29 @@ export const inject = ['tools']
 /** RPC channel shared with the Client half. */
 export const CHANNEL = '/dsh-readonly-mode'
 
+/** Local support log. Holds lifecycle events, RPC endpoint names and denials — no payloads. */
+const LOG_PATH = join(tmpdir(), 'dsh-readonly-mode.log')
+const LOG_LIMIT = 256 * 1024
+
+const log = (line) => {
+  try {
+    appendFileSync(LOG_PATH, `${new Date().toISOString()} ${line}\n`)
+  } catch {
+    /* logging must never break enforcement */
+  }
+}
+
+const resetLog = () => {
+  try {
+    if (statSync(LOG_PATH).size > LOG_LIMIT) writeFileSync(LOG_PATH, '')
+  } catch {
+    /* first run */
+  }
+}
+
 /**
- * Tools that only read. Everything outside this set (and the two argument-aware
- * families below) is refused while read-only mode is on.
+ * Tools that only read. Everything outside this set (and the dictionary below) is
+ * refused while read-only mode is on.
  */
 const READ_TOOLS = new Set([
   // Filesystem / workspace inspection
@@ -112,10 +139,20 @@ function denyReason(toolName) {
   )
 }
 
+/**
+ * Session id of one tool execution.
+ *
+ * `ToolExecution.agent` is optional and `Session.header.id` is the canonical id
+ * (`Session.id` is a derived accessor), so the shapes are tried widest-first and
+ * the first string wins.
+ */
 function sessionIdOf(execution) {
-  const session = execution?.agent?.session
-  const id = session?.header?.id ?? session?.id
-  return typeof id === 'string' ? id : undefined
+  const session = execution?.agent?.session ?? execution?.session
+  const candidates = [session?.header?.id, session?.id, execution?.sessionId, execution?.agent?.id]
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate !== '') return candidate
+  }
+  return undefined
 }
 
 function errorMessage(error) {
@@ -151,6 +188,7 @@ function handleRpc(registry, endpoint, payload) {
   const body = payload ?? {}
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
 
+  if (endpoint === 'ping') return ok({ channel: CHANNEL, sessions: registry.list() })
   if (endpoint === 'list') return ok({ sessions: registry.list() })
   if (sessionId === '') return failure('bad-request', 'sessionId is required')
 
@@ -164,10 +202,14 @@ function handleRpc(registry, endpoint, payload) {
   return failure('not-found', `unknown endpoint "${String(endpoint)}"`)
 }
 
+/**
+ * Human text plus a machine-readable `readonly=on|off` token, so the Client half can
+ * read the state back from a command result when the RPC channel is unavailable.
+ */
 function describe(active) {
   return active
-    ? '只读模式：已开启（本会话仅放行读取类工具）。'
-    : '只读模式：已关闭（本会话可正常写入）。'
+    ? `只读模式：已开启（本会话仅放行读取类工具）。readonly=on`
+    : `只读模式：已关闭（本会话可正常写入）。readonly=off`
 }
 
 function createCommand(registry) {
@@ -188,12 +230,15 @@ function createCommand(registry) {
         return { kind: 'success', text: describe(current) }
       }
       if (['on', '1', 'true', '开', '开启'].includes(word)) {
+        log(`command on ${sessionId}`)
         return { kind: 'success', text: describe(registry.set(sessionId, true)) }
       }
       if (['off', '0', 'false', '关', '关闭'].includes(word)) {
+        log(`command off ${sessionId}`)
         return { kind: 'success', text: describe(registry.set(sessionId, false)) }
       }
       if (['toggle', '切换'].includes(word)) {
+        log(`command toggle ${sessionId}`)
         return { kind: 'success', text: describe(registry.set(sessionId, !current)) }
       }
       return { kind: 'error', text: `只读模式：无法识别 "${word}"，可用 on / off / toggle / status。` }
@@ -201,8 +246,31 @@ function createCommand(registry) {
   }
 }
 
+/** The Connection service, whichever way this build exposes it to a plugin fiber. */
+function connectionOf(scope) {
+  try {
+    const direct = scope.get('connection')
+    if (direct !== undefined && direct !== null) return direct
+  } catch {
+    /* fall through */
+  }
+  try {
+    if (scope.connection !== undefined) return scope.connection
+  } catch {
+    /* fall through */
+  }
+  try {
+    if (scope.root?.connection !== undefined) return scope.root.connection
+  } catch {
+    /* fall through */
+  }
+  return undefined
+}
+
 export function apply(ctx) {
   const registry = createRegistry()
+  resetLog()
+  log(`apply (${process.version})`)
 
   // Enforcement: one guard for every tool call of every scope, reading live state.
   ctx.effect(
@@ -212,29 +280,46 @@ export function apply(ctx) {
         if (!registry.isArmed(sessionId)) return undefined
         const toolName = typeof execution?.name === 'string' ? execution.name : ''
         if (isReadOnlyCall(toolName, execution?.arguments)) return undefined
+        log(`denied ${toolName}`)
         return denyReason(toolName)
       }),
     'dsh-readonly-mode: tool guard',
   )
+  log('guard registered')
 
-  // Client ⇄ Host channel used by the composer switch.
-  ctx.inject(['connection'], (scope) => {
+  // Client ⇄ Host channel used by the composer switch. `webServer` is requested
+  // alongside `connection` because the channel is served as a web route: some
+  // builds resolve `connection.rpc` lazily through that service.
+  ctx.inject(['connection', 'webServer'], (scope) => {
     try {
-      const connection = scope.root?.connection
-      if (connection === undefined || typeof connection.rpc?.handle !== 'function') return
-      const dispose = connection.rpc.handle(CHANNEL, (endpoint, payload) => handleRpc(registry, endpoint, payload))
+      const connection = connectionOf(scope)
+      if (connection === undefined) {
+        log('channel: no connection service in this build')
+        return
+      }
+      if (typeof connection.rpc?.handle !== 'function') {
+        log('channel: connection.rpc.handle missing')
+        return
+      }
+      const dispose = connection.rpc.handle(CHANNEL, (endpoint, payload) => {
+        log(`rpc ${String(endpoint)}`)
+        return handleRpc(registry, endpoint, payload)
+      })
       scope.effect(() => dispose, 'dsh-readonly-mode: rpc channel')
-      ctx.logger?.info?.(`[dsh-readonly-mode] rpc channel ${CHANNEL} ready`)
+      log(`channel registered ${CHANNEL}`)
     } catch (error) {
+      log(`channel failed: ${errorMessage(error)}`)
       ctx.logger?.warn?.(`[dsh-readonly-mode] RPC channel registration failed: ${errorMessage(error)}`)
     }
   })
 
-  // Keyboard / headless fallback: /readonly on|off|toggle|status
+  // Keyboard / headless / Client fallback: /readonly on|off|toggle|status
   ctx.inject(['commands'], (scope) => {
     try {
       scope.effect(() => scope.commands.register(createCommand(registry)), 'dsh-readonly-mode: /readonly command')
+      log('command registered')
     } catch (error) {
+      log(`command failed: ${errorMessage(error)}`)
       ctx.logger?.warn?.(`[dsh-readonly-mode] /readonly command registration failed: ${errorMessage(error)}`)
     }
   })
