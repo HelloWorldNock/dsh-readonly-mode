@@ -196,10 +196,11 @@ function makeReactRuntime() {
 }
 
 /** Mount the client half against a fake context and return what it registered. */
-async function mountClient(get) {
+async function mountClient(get, extra = {}) {
   const registered = [];
   const localeRegistered = [];
   const ctx = {
+    ...extra,
     get,
     effect(fn) {
       return fn();
@@ -232,7 +233,7 @@ async function mountClient(get) {
   return { module, registered, localeRegistered, runtime };
 }
 
-/* --- scenario A: the package RPC channel answers --- */
+/* --- scenario A: only the package RPC channel answers --- */
 const rpcCalls = [];
 const scenarioA = await mountClient((name) =>
   name === 'connection'
@@ -247,7 +248,7 @@ const scenarioA = await mountClient((name) =>
     : undefined,
 );
 
-check('client inject list', scenarioA.module.inject, ['slots', 'locale']);
+check('client inject list', scenarioA.module.inject, ['slots', 'locale', 'remote.commands']);
 check('locale namespace', scenarioA.localeRegistered, [['readonly-mode', ['zh', 'en']]]);
 check('style tagged', styleNodes[0].dataset.plugin, 'dsh-readonly-mode');
 check('slot name', scenarioA.registered[0].options.name, 'conversation.input.right');
@@ -272,21 +273,18 @@ const noSession = scenarioA.runtime.render(toggleA, {});
 check('button rendered without a session id too', noSession.type, 'button');
 check('without a session id it is not armed', noSession.props['data-readonly-mode'], 'off');
 
-/* --- scenario B: no RPC channel, the /readonly command carries the state --- */
+/* --- scenario B: no RPC channel; `remote.commands` (the injected shape) answers --- */
 const commandCalls = [];
-const scenarioB = await mountClient((name) => {
-  if (name === 'remote') {
-    return {
-      commands: {
-        async execute(sessionId, line) {
-          commandCalls.push([sessionId, line]);
-          const on = line !== '/readonly off';
-          return { ok: true, value: { kind: 'success', text: on ? '已开启。readonly=on' : '已关闭。readonly=off' } };
-        },
+const scenarioB = await mountClient(() => undefined, {
+  remote: {
+    commands: {
+      async execute(sessionId, line) {
+        commandCalls.push([sessionId, line]);
+        const on = line !== '/readonly off';
+        return { ok: true, value: { kind: 'success', text: on ? '已开启。readonly=on' : '已关闭。readonly=off' } };
       },
-    };
-  }
-  return undefined;
+    },
+  },
 });
 
 const toggleB = scenarioB.registered[0].component;

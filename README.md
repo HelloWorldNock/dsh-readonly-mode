@@ -83,7 +83,8 @@ plugin_manager action=install_bundle target="<本仓库目录的绝对路径>"
 
 ## 变更记录
 
-- **0.2.0** — 适配 DSH `0.2.2-rc.1`。失效原因是界面侧状态读取走的那条通道在该构建里不可用：客户端硬注入 `connection`（拿不到时整个客户端半边不挂载），且宿主侧 `connection.rpc.handle` 直接抛 `cannot get property "webServer" without inject`。现在：客户端只硬依赖 `slots` 与 `locale`；状态读写改走 `/readonly` 命令（命令输出带 `readonly=on|off` 机器可读标记），RPC 通道降为备选；会话 ID 解析补了多种形状兜底；新增宿主侧诊断日志。
+- **0.2.1** — 界面侧改为硬注入 `remote.commands` 并直接用 `ctx.remote.commands.execute`：在 `0.2.2-rc.1` 的客户端里 `remote` 是服务而不是属性，不声明注入就取不到，开关会停在错误态（红色）。
+- **0.2.0** — 适配 DSH `0.2.2-rc.1`。失效原因是界面侧状态读取走的那条通道在该构建里不可用：客户端硬注入了 `connection`（拿不到时整个客户端半边不挂载），且宿主侧 `connection.rpc.handle` 直接抛 `cannot get property "webServer" without inject`。现在：客户端状态读写改走 `/readonly` 命令（命令输出带 `readonly=on|off` 机器可读标记），RPC 通道降为备选；会话 ID 解析补了多种形状兜底；新增宿主侧诊断日志。
 - **0.1.0** — 首版：全局工具守卫 + 输入框右侧锁形开关 + `/readonly` 命令。
 
 ## 自测

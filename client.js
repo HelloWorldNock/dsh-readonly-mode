@@ -98,8 +98,18 @@ window.__ModuleLoader__.load({
       return '';
     }
 
-    /** The commands service: `remote.commands` when present, else the bare service. */
+    /**
+     * The commands service. `remote.commands` is the injected face the Host exposes
+     * for a Client plugin to run a slash command; the other two shapes are older
+     * ways the same service has been reachable.
+     */
     function commandsOf(ctx) {
+      try {
+        const commands = ctx.remote && ctx.remote.commands;
+        if (commands && typeof commands.execute === 'function') return commands;
+      } catch (error) {
+        /* `remote` is not injected here; fall through to the lookup shapes */
+      }
       const remote = serviceOf(ctx, 'remote');
       const candidates = [remote && remote.commands, serviceOf(ctx, 'commands')];
       for (const candidate of candidates) {
@@ -108,7 +118,12 @@ window.__ModuleLoader__.load({
       return undefined;
     }
 
-    async function runCommand(ctx, sessionId, line) {
+    /**
+     * Run one `/readonly` line and read the resulting state out of it.
+     * @param assume - state to report when the command succeeded but its output
+     * carries no `readonly=on|off` marker (older host halves).
+     */
+    async function runCommand(ctx, sessionId, line, assume) {
       const commands = commandsOf(ctx);
       if (commands === undefined) {
         throw new Error('commands service is unavailable');
@@ -120,8 +135,9 @@ window.__ModuleLoader__.load({
       }
       const text = textOf(result.value);
       const match = STATE_TOKEN.exec(text);
-      if (match === null) throw new Error(text || 'command returned no read-only state');
-      return match[1].toLowerCase() === 'on';
+      if (match !== null) return match[1].toLowerCase() === 'on';
+      if (assume !== undefined) return assume;
+      throw new Error(text || 'command returned no read-only state');
     }
 
     /**
@@ -146,7 +162,7 @@ window.__ModuleLoader__.load({
     /** Flip the switch, command first for the same reason as `readState`. */
     async function writeState(ctx, sessionId, active) {
       if (commandsOf(ctx) !== undefined) {
-        return await runCommand(ctx, sessionId, active ? '/readonly on' : '/readonly off');
+        return await runCommand(ctx, sessionId, active ? '/readonly on' : '/readonly off', active);
       }
       const rpc = rpcOf(ctx);
       if (rpc === undefined) throw new Error('no transport to the host half');
@@ -186,6 +202,7 @@ window.__ModuleLoader__.load({
               setActive(null);
               setPhase('error');
               setNote(error && error.message ? String(error.message) : '');
+              console.error('[readonly-mode] could not read the switch state', error);
             });
           return () => {
             cancelled = true;
@@ -204,6 +221,7 @@ window.__ModuleLoader__.load({
             .catch((error) => {
               setPhase('error');
               setNote(error && error.message ? String(error.message) : '');
+              console.error('[readonly-mode] could not switch', error);
             })
             .then(() => setBusy(false));
         };
@@ -233,7 +251,9 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots', 'locale'],
+      // `remote.commands` is the Host's injected face for running a slash command
+      // from a Client plugin; without it declared here, `ctx.remote` is unreadable.
+      inject: ['slots', 'locale', 'remote.commands'],
       apply(ctx) {
         const dicts = {
           zh: {
@@ -288,6 +308,8 @@ window.__ModuleLoader__.load({
             createToggle(ctx, t),
           ),
         );
+
+        console.log('[readonly-mode] client half mounted in conversation.input.right');
       },
     };
   },

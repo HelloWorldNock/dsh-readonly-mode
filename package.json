@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-readonly-mode",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Per-session read-only mode switch for the DSH chat composer",
   "license": "MIT",
