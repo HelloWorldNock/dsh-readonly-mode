@@ -95,6 +95,26 @@ node test.mjs
 
 不启动 Harness：脚本伪造 `ctx`、`scope`、`window.__ModuleLoader__` 与 `document`，直接驱动真实的 `index.js` 与 `client.js`，覆盖守卫判定（放行/拒绝/参数例外/跨会话隔离）、RPC 端点、`/readonly` 四个子命令，以及客户端插槽注册。不能替代真机验证（真实 Cordis 选项、真实 React 渲染、真实点击）。
 
+### 实机验证（DSH 0.2.2-rc.1）
+
+开关打开后，在会话里让模型新建桌面文件，调用被拦下：
+
+```
+Error: [只读模式] 该会话已开启只读模式，工具 "pwsh" 不在只读放行列表内，本次调用被拒绝。
+Read-only mode is on for this session; "pwsh" is not a read-only tool, so the call was denied.
+```
+
+宿主日志 `%TEMP%\dsh-readonly-mode.log` 的同一时段记录：
+
+```
+11:42:58  command on  session-<id>
+11:43:00  command off session-<id>
+11:43:13  command on  session-<id>
+11:43:36  denied pwsh
+```
+
+`command on/off` 来自输入框锁图标的点击（客户端经 `ctx.remote.commands.execute` 打到宿主），紧接的 `denied pwsh` 是同一会话里被拦下的写入尝试。
+
 ## License
 
 MIT
