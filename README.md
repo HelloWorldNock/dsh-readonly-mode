@@ -17,8 +17,9 @@ Per-session read-only switch for the DSH chat composer. While armed, every tool 
 - **按会话生效**：状态以会话 ID 为键，别的会话不受影响。
 - **拒绝在工具执行前发生**：模型收到明确的拒绝原因（中英双语），并被告知请你关闭开关，而不是拿到一个静默失败。
 - **委派一并拦住**：`subagent`、`workflow` 不在放行表内，只读会话无法通过子会话绕回写入。
-- **开关只能由用户操作**：界面通过 `/readonly` 命令读写状态，模型侧没有任何工具能打开或关闭它。
-- **不依赖单一通道**：优先走命令；若构建里能拿到 `connection.rpc`，包内 RPC 通道会自动启用并优先使用。宿主换版本导致其中一条路断掉时，开关不会变成死按钮。
+- **开关只能由用户操作**：界面通过宿主自持的 `/dsh-readonly-mode` 路由读写状态，模型侧没有任何工具能打开或关闭它。
+- **不往对话里写东西**：状态读写走上面那条路由，不执行斜杠命令。命令每次执行都会在会话日志里落 `command/run` + `command/done`，界面渲染成一行对话——那是切换会话时对话里冒出一堆「已开启/已关闭」提示的原因。路由不落任何会话事件。
+- **状态按会话保留**：开关状态是宿主内存里按会话 ID 的集合，切到别的会话不会改它，切回来时按钮读到的还是离开时的状态。
 - **可诊断**：宿主把启动、通道注册结果、拦截记录追加到系统临时目录的 `dsh-readonly-mode.log`，出问题时先看这个文件。
 
 ## 安装
@@ -63,8 +64,8 @@ plugin_manager action=install_bundle target="<本仓库目录的绝对路径>"
 
 | 环节 | 做法 | 依赖的宿主契约 |
 | --- | --- | --- |
-| 状态 | 宿主进程内存里的 `Set<sessionId>`；界面通过 `/readonly status|on|off` 命令（`ctx.remote.commands.execute`）读写，命令输出带 `readonly=on\|off` 标记供解析。包内 RPC 通道 `/dsh-readonly-mode` 在能拿到 `connection.rpc` 的构建上作为备选 | `remote.commands.execute` · `connection.rpc.handle/call` |
-| 开关 | 注册进 `conversation.input.right` 槽，`inject: (sessionId) => ({ sessionId })`；客户端只硬依赖 `slots` 与 `locale`，其余服务按需懒取 | `slots.register` |
+| 状态 | 宿主进程内存里的 `Set<sessionId>`；界面用 `fetch` 打宿主注册的 `/dsh-readonly-mode` 路由（`GET /get?sessionId=…`、`POST /set {sessionId,active}`、`GET /list`、`GET /ping`），返回 `{ok:true,value}` / `{ok:false,error}` 信封。路由是 `webServer` 上的 prefix 路由，不落会话事件 | `ctx.webServer.register({ kind: 'prefix', path, handler })` |
+| 开关 | 注册进 `conversation.input.right` 槽，`inject: (sessionId) => ({ sessionId })`；客户端只硬依赖 `slots` 与 `locale`，宿主走 `fetch`，不依赖 `connection` / `remote` | `slots.register` |
 | 拦截 | `ctx.tools.guard(fn)` 全局守卫：按 `execution.agent.session.header.id` 查表，不在放行表内就返回拒绝原因 | `ToolGuard = (execution) => string \| undefined` |
 | 命令 | `ctx.commands.register({ name: 'readonly', recordInput: false, handler })` | `CommandDefinition` |
 | 文案 | `ctx.locale.register('readonly-mode', { zh, en })`，slot 内 `t()` 本地化 | Client locale 服务 |
@@ -78,8 +79,15 @@ plugin_manager action=install_bundle target="<本仓库目录的绝对路径>"
 - 拒绝以工具错误返回给模型，模型可能换个写法重试——仍然会被拒绝，但会多花一轮。
 - `univer_screenshot` 与 `blender_rt_see` 会把 PNG 写到磁盘，是为了让模型「看」而保留的例外（产物在临时/输出目录）。
 - 与 permission preset 是叠加关系：preset 是部署级，本插件是会话级，两者不互相替代。
-- 依赖 DSH 的契约（slots / commands / `remote.commands` / `tools.guard`）。已在 `0.2.2-rc.1` 上跑通；宿主升级后接口若有变化，需要同步调整。
-- 桌面版 `0.2.2-rc.1` 里第三方插件拿不到 `connection.rpc`（注册时报 `cannot get property "webServer" without inject`），所以包内 RPC 通道在这类构建上会被跳过，界面改走命令通道。日志里能看到这一行，属预期。
+- 依赖 DSH 的契约（`slots` / `webServer` 路由 / `tools.guard`）。已在 `0.2.2-rc.1` 上跑通；宿主升级后接口若有变化，需要同步调整。
+- 路由与页面同源，靠同源 `fetch` 通信；它不挂在 `/api` 的鉴权网关上。若将来宿主把第三方 prefix 路由也收进鉴权，界面侧需要改成带凭据的调用。
+- `0.2.2-rc.1` 里第三方插件拿不到 `connection.rpc`（注册时报 `cannot get property "webServer" without inject`），所以状态传输不再走包内 RPC 通道，改为 `webServer` 上的普通 prefix 路由。
+
+## 变更记录
+
+- **0.2.2** — 状态传输从 `/readonly` 命令改为 `ctx.webServer` 上的 prefix 路由（`fetch`）：命令每次执行都会在对话里留一行提示，切换会话时尤其明显。现在界面读写状态不产生任何会话事件，`/readonly` 只留给手动输入；状态仍按会话保留，切回去继承离开时的值。
+- **0.2.1** — 界面侧改为硬注入 `remote.commands` 并直接用 `ctx.remote.commands.execute`：在 `0.2.2-rc.1` 的客户端里 `remote` 是服务而不是属性，不声明注入就取不到，开关会停在错误态（红色）。
+- 桌面版 `0.2.2-rc.1` 里第三方插件拿不到 `connection.rpc`（注册时报 `cannot get property "webServer" without inject`），所以状态传输改走 `webServer` 上的普通 prefix 路由，不再依赖它。
 
 ## 变更记录
 
@@ -93,7 +101,7 @@ plugin_manager action=install_bundle target="<本仓库目录的绝对路径>"
 node test.mjs
 ```
 
-不启动 Harness：脚本伪造 `ctx`、`scope`、`window.__ModuleLoader__` 与 `document`，直接驱动真实的 `index.js` 与 `client.js`，覆盖守卫判定（放行/拒绝/参数例外/跨会话隔离）、RPC 端点、`/readonly` 四个子命令，以及客户端插槽注册。不能替代真机验证（真实 Cordis 选项、真实 React 渲染、真实点击）。
+不启动 Harness：脚本伪造 `ctx`、`scope`、`window.__ModuleLoader__`、`document` 与 `fetch`，直接驱动真实的 `index.js` 与 `client.js`，覆盖守卫判定（放行/拒绝/参数例外/跨会话隔离）、路由端点（get/set/list/ping、方法错、坏 JSON、未知端点）、`/readonly` 四个子命令、客户端插槽注册，以及切换会话后重新读取而非继承上一会话的状态。不能替代真机验证（真实 Cordis 选项、真实 React 渲染、真实点击）。
 
 ### 实机验证（DSH 0.2.2-rc.1）
 
@@ -113,7 +121,7 @@ Read-only mode is on for this session; "pwsh" is not a read-only tool, so the ca
 11:43:36  denied pwsh
 ```
 
-`command on/off` 来自输入框锁图标的点击（客户端经 `ctx.remote.commands.execute` 打到宿主），紧接的 `denied pwsh` 是同一会话里被拦下的写入尝试。
+`command on/off` 来自 `/readonly`（手动输入命令时才有），紧接的 `denied pwsh` 是同一会话里被拦下的写入尝试。输入框锁图标走路由，日志里是 `http get` / `http set` 行。
 
 ## License
 

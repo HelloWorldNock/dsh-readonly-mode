@@ -6,7 +6,6 @@ window.__ModuleLoader__.load({
 
     const ID = 'readonly-mode';
     const CHANNEL = '/dsh-readonly-mode';
-    const STATE_TOKEN = /readonly=(on|off)/i;
 
     const FALLBACK = {
       label: '只读',
@@ -63,113 +62,64 @@ window.__ModuleLoader__.load({
       return undefined;
     }
 
-    /**
-     * A service, however this build exposes it: `ctx.get(name)` where the context has
-     * a service registry, a plain property where it does not. Never throws.
-     */
-    function serviceOf(ctx, name) {
-      let viaGet;
+    function fetchOf() {
       try {
-        viaGet = ctx.get(name);
+        if (typeof fetch === 'function') return fetch;
       } catch (error) {
-        viaGet = undefined;
+        /* fall through to the global lookup */
       }
-      if (viaGet !== undefined && viaGet !== null) return viaGet;
       try {
-        const direct = ctx[name];
-        if (direct !== undefined && direct !== null) return direct;
+        const scope = typeof globalThis !== 'undefined' ? globalThis : undefined;
+        if (scope && typeof scope.fetch === 'function') return scope.fetch.bind(scope);
       } catch (error) {
-        /* a strict context refuses undeclared services; treat that as absent */
-      }
-      return undefined;
-    }
-
-    function rpcOf(ctx) {
-      const connection = serviceOf(ctx, 'connection');
-      const rpc = connection && connection.rpc;
-      return rpc && typeof rpc.call === 'function' ? rpc : undefined;
-    }
-
-    /** Text out of a command result, tolerating the shapes a command may return. */
-    function textOf(value) {
-      if (typeof value === 'string') return value;
-      if (value && typeof value.text === 'string') return value.text;
-      if (value && typeof value.message === 'string') return value.message;
-      return '';
-    }
-
-    /**
-     * The commands service. `remote.commands` is the injected face the Host exposes
-     * for a Client plugin to run a slash command; the other two shapes are older
-     * ways the same service has been reachable.
-     */
-    function commandsOf(ctx) {
-      try {
-        const commands = ctx.remote && ctx.remote.commands;
-        if (commands && typeof commands.execute === 'function') return commands;
-      } catch (error) {
-        /* `remote` is not injected here; fall through to the lookup shapes */
-      }
-      const remote = serviceOf(ctx, 'remote');
-      const candidates = [remote && remote.commands, serviceOf(ctx, 'commands')];
-      for (const candidate of candidates) {
-        if (candidate && typeof candidate.execute === 'function') return candidate;
+        /* no fetch in this page */
       }
       return undefined;
     }
 
     /**
-     * Run one `/readonly` line and read the resulting state out of it.
-     * @param assume - state to report when the command succeeded but its output
-     * carries no `readonly=on|off` marker (older host halves).
+     * One call to the Host half. The switch travels over a plain route on the web
+     * server, never as a slash command: a command execution appends
+     * `command/run` + `command/done` to the session log and would show up in the
+     * conversation every time the composer reads the state.
      */
-    async function runCommand(ctx, sessionId, line, assume) {
-      const commands = commandsOf(ctx);
-      if (commands === undefined) {
-        throw new Error('commands service is unavailable');
+    async function callHost(path, init) {
+      const request = fetchOf();
+      if (request === undefined) throw new Error('fetch is unavailable in this page');
+      const response = await request(CHANNEL + path, {
+        cache: 'no-store',
+        credentials: 'same-origin',
+        ...init,
+      });
+      const text = await response.text();
+      let payload;
+      try {
+        payload = JSON.parse(text);
+      } catch (error) {
+        throw new Error('host half answered ' + response.status + ': ' + text.slice(0, 120));
       }
-      const result = await commands.execute(sessionId, line, []);
-      if (!result || result.ok !== true) {
-        const error = result && result.error;
-        throw new Error((error && error.message) || 'command failed');
-      }
-      const text = textOf(result.value);
-      const match = STATE_TOKEN.exec(text);
-      if (match !== null) return match[1].toLowerCase() === 'on';
-      if (assume !== undefined) return assume;
-      throw new Error(text || 'command returned no read-only state');
+      if (payload && payload.ok === true) return payload.value;
+      const failure = payload && payload.error;
+      throw new Error(
+        (failure && (failure.message || failure.code)) || 'host half answered ' + response.status,
+      );
     }
 
-    /**
-     * Current switch state. The `/readonly` command is the primary transport: it is
-     * the documented Client → Host path for a user action and does not depend on the
-     * package RPC channel, which some host builds cannot serve to a plugin. The RPC
-     * channel stays as a secondary path where `connection.rpc` does resolve.
-     */
+    /** Current switch state for one session. */
     async function readState(ctx, sessionId) {
-      if (commandsOf(ctx) !== undefined) {
-        return await runCommand(ctx, sessionId, '/readonly status');
-      }
-      const rpc = rpcOf(ctx);
-      if (rpc === undefined) throw new Error('no transport to the host half');
-      const result = await rpc.call(CHANNEL, 'get', { sessionId });
-      if (result && result.ok === true && result.value && typeof result.value.active === 'boolean') {
-        return result.value.active;
-      }
+      const value = await callHost('/get?sessionId=' + encodeURIComponent(sessionId));
+      if (value && typeof value.active === 'boolean') return value.active;
       throw new Error('host half did not report a read-only state');
     }
 
-    /** Flip the switch, command first for the same reason as `readState`. */
+    /** Flip the switch for one session; resolves with the state the host stored. */
     async function writeState(ctx, sessionId, active) {
-      if (commandsOf(ctx) !== undefined) {
-        return await runCommand(ctx, sessionId, active ? '/readonly on' : '/readonly off', active);
-      }
-      const rpc = rpcOf(ctx);
-      if (rpc === undefined) throw new Error('no transport to the host half');
-      const result = await rpc.call(CHANNEL, 'set', { sessionId, active });
-      if (result && result.ok === true && result.value && typeof result.value.active === 'boolean') {
-        return result.value.active;
-      }
+      const value = await callHost('/set', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId, active }),
+      });
+      if (value && typeof value.active === 'boolean') return value.active;
       throw new Error('host half did not accept the switch');
     }
 
@@ -251,9 +201,10 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      // `remote.commands` is the Host's injected face for running a slash command
-      // from a Client plugin; without it declared here, `ctx.remote` is unreadable.
-      inject: ['slots', 'locale', 'remote.commands'],
+      // No service beyond `slots` and `locale` is required: the host half is reached
+      // over `fetch`, so a build that does not expose `connection` or `remote` to a
+      // Client plugin still mounts the switch.
+      inject: ['slots', 'locale'],
       apply(ctx) {
         const dicts = {
           zh: {

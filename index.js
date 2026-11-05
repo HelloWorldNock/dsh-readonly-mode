@@ -10,8 +10,12 @@
  * the switch is on. Anything not proven to be a read is denied, which is the only
  * way to honour "不进行任何写入操作" without silently leaking new writer tools.
  *
- * The Client half reaches this state either through the package RPC channel below
- * or through the `/readonly` command; both paths write to the same registry.
+ * The Client half reads and writes that registry through a small JSON route on the web
+ * server (`CHANNEL`); the `/readonly` command is a convenience for typing it by hand.
+ * The switch must never travel as a slash command: every command execution appends
+ * `command/run` + `command/done` to the session log and the Client renders one
+ * transcript row per command, which would litter the conversation on every session
+ * switch. A plain route writes nothing.
  */
 
 import { appendFileSync, statSync, writeFileSync } from 'node:fs'
@@ -184,7 +188,7 @@ function createRegistry() {
   }
 }
 
-function handleRpc(registry, endpoint, payload) {
+function handleCall(registry, endpoint, payload) {
   const body = payload ?? {}
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
 
@@ -246,25 +250,90 @@ function createCommand(registry) {
   }
 }
 
-/** The Connection service, whichever way this build exposes it to a plugin fiber. */
-function connectionOf(scope) {
+const BODY_LIMIT = 64 * 1024
+
+function sendJson(res, status, payload) {
   try {
-    const direct = scope.get('connection')
-    if (direct !== undefined && direct !== null) return direct
+    res.statusCode = status
+    res.setHeader('content-type', 'application/json; charset=utf-8')
+    res.setHeader('cache-control', 'no-store')
+    res.end(JSON.stringify(payload))
   } catch {
-    /* fall through */
+    /* the peer went away; nothing left to report to */
   }
-  try {
-    if (scope.connection !== undefined) return scope.connection
-  } catch {
-    /* fall through */
+}
+
+/** Reads a JSON body, resolving `{}` for an empty body and `null` for anything unusable. */
+function readJsonBody(req) {
+  return new Promise((resolve) => {
+    const chunks = []
+    let size = 0
+    let settled = false
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > BODY_LIMIT) {
+        finish(null)
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8').trim()
+      if (text === '') return finish({})
+      try {
+        finish(JSON.parse(text))
+      } catch {
+        finish(null)
+      }
+    })
+    req.on('error', () => finish(null))
+  })
+}
+
+/**
+ * The Client ⇄ Host route: `GET CHANNEL/get?sessionId=…`, `GET CHANNEL/list`,
+ * `GET CHANNEL/ping`, `POST CHANNEL/set {sessionId, active}`. Answers the same
+ * `{ok:true,value}` / `{ok:false,error}` envelope as the rest of the harness.
+ */
+export function createHttpHandler(registry) {
+  return async (req, res) => {
+    try {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const rest = url.pathname.slice(CHANNEL.length).replace(/^\/+|\/+$/g, '')
+      const endpoint = rest === '' ? 'ping' : rest
+
+      if (endpoint === 'set') {
+        if (req.method !== 'POST') {
+          return sendJson(res, 405, failure('method-not-allowed', 'use POST'))
+        }
+        const body = await readJsonBody(req)
+        if (body === null || typeof body !== 'object') {
+          return sendJson(res, 400, failure('bad-request', 'body must be a JSON object'))
+        }
+        log(`http set ${String(body.sessionId)} ${String(body.active)}`)
+        const result = handleCall(registry, endpoint, body)
+        return sendJson(res, result.ok ? 200 : 400, result)
+      }
+
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        return sendJson(res, 405, failure('method-not-allowed', 'use GET'))
+      }
+      const payload = {}
+      const sessionId = url.searchParams.get('sessionId')
+      if (sessionId !== null) payload.sessionId = sessionId
+      if (endpoint === 'get') log(`http get ${String(payload.sessionId)}`)
+      const result = handleCall(registry, endpoint, payload)
+      return sendJson(res, result.ok ? 200 : 400, result)
+    } catch (error) {
+      log(`http failed: ${errorMessage(error)}`)
+      return sendJson(res, 500, failure('internal', errorMessage(error)))
+    }
   }
-  try {
-    if (scope.root?.connection !== undefined) return scope.root.connection
-  } catch {
-    /* fall through */
-  }
-  return undefined
 }
 
 export function apply(ctx) {
@@ -287,29 +356,19 @@ export function apply(ctx) {
   )
   log('guard registered')
 
-  // Client ⇄ Host channel used by the composer switch. `webServer` is requested
-  // alongside `connection` because the channel is served as a web route: some
-  // builds resolve `connection.rpc` lazily through that service.
-  ctx.inject(['connection', 'webServer'], (scope) => {
+  // Client ⇄ Host transport. A plain prefix route on the web server: the composer
+  // switch polls it and flips it, and nothing is written into the conversation.
+  ctx.inject(['webServer'], (scope) => {
     try {
-      const connection = connectionOf(scope)
-      if (connection === undefined) {
-        log('channel: no connection service in this build')
-        return
-      }
-      if (typeof connection.rpc?.handle !== 'function') {
-        log('channel: connection.rpc.handle missing')
-        return
-      }
-      const dispose = connection.rpc.handle(CHANNEL, (endpoint, payload) => {
-        log(`rpc ${String(endpoint)}`)
-        return handleRpc(registry, endpoint, payload)
-      })
-      scope.effect(() => dispose, 'dsh-readonly-mode: rpc channel')
-      log(`channel registered ${CHANNEL}`)
+      const handler = createHttpHandler(registry)
+      scope.effect(
+        () => scope.webServer.register({ kind: 'prefix', path: CHANNEL, handler }),
+        'dsh-readonly-mode: http route',
+      )
+      log(`route registered ${CHANNEL}`)
     } catch (error) {
-      log(`channel failed: ${errorMessage(error)}`)
-      ctx.logger?.warn?.(`[dsh-readonly-mode] RPC channel registration failed: ${errorMessage(error)}`)
+      log(`route failed: ${errorMessage(error)}`)
+      ctx.logger?.warn?.(`[dsh-readonly-mode] route registration failed: ${errorMessage(error)}`)
     }
   })
 

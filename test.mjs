@@ -1,4 +1,5 @@
 import { pathToFileURL } from 'node:url';
+import { EventEmitter } from 'node:events';
 import path from 'node:path';
 
 const PKG = 'F:\\AgentWorkProject\\TS0 杂务\\plugins\\dsh-readonly-mode';
@@ -14,28 +15,21 @@ const check = (label, actual, expected) => {
     console.log(`ok   ${label}`);
   }
 };
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 /* ---------------- host half ---------------- */
 const host = await import(pkgUrl('index.js'));
 
 const guards = [];
 const commands = [];
+const routes = [];
 const effects = [];
-let rpcHandler;
-let rpcChannel;
 
 const hostScope = {
-  // `connection` is reachable through the fiber scope in current builds and through
-  // root in older ones; the plugin must accept either.
-  root: {
-    connection: {
-      rpc: {
-        handle(channel, handler) {
-          rpcChannel = channel;
-          rpcHandler = handler;
-          return () => {};
-        },
-      },
+  webServer: {
+    register(route) {
+      routes.push(route);
+      return () => {};
     },
   },
   commands: {
@@ -72,8 +66,37 @@ const hostCtx = {
 host.apply(hostCtx);
 
 check('guard registered', guards.length, 1);
-check('rpc channel registered', rpcChannel, host.CHANNEL);
+check('route registered once', routes.length, 1);
+check('route is a prefix on the channel', [routes[0].kind, routes[0].path], ['prefix', host.CHANNEL]);
 check('command registered', commands.map((c) => c.name), ['readonly']);
+
+const route = routes[0];
+
+/** One request against the plugin's own route handler. */
+async function request(method, suffix, body) {
+  const req = new EventEmitter();
+  req.method = method;
+  req.url = host.CHANNEL + suffix;
+  const res = {
+    statusCode: 0,
+    headers: {},
+    body: '',
+    setHeader(key, value) {
+      this.headers[key] = value;
+    },
+    end(text) {
+      this.body = text ?? '';
+    },
+  };
+  const pending = route.handler(req, res);
+  const payload = body === undefined ? '' : typeof body === 'string' ? body : JSON.stringify(body);
+  setTimeout(() => {
+    if (payload !== '') req.emit('data', Buffer.from(payload));
+    req.emit('end');
+  }, 0);
+  await pending;
+  return { status: res.statusCode, json: JSON.parse(res.body === '' ? 'null' : res.body) };
+}
 
 const guard = guards[0];
 const call = (name, sessionId, args) =>
@@ -81,17 +104,20 @@ const call = (name, sessionId, args) =>
 
 check('unarmed session allows write', call('write', 's1'), undefined);
 
-const armed = await rpcHandler('set', { sessionId: 's1', active: true });
-check('rpc set on', armed, { ok: true, value: { sessionId: 's1', active: true } });
-check('rpc get on', await rpcHandler('get', { sessionId: 's1' }), {
+const armed = await request('POST', '/set', { sessionId: 's1', active: true });
+check('route set on', armed.json, { ok: true, value: { sessionId: 's1', active: true } });
+check('route get on', (await request('GET', '/get?sessionId=s1')).json, {
   ok: true,
   value: { sessionId: 's1', active: true },
 });
-check('rpc get other session', await rpcHandler('get', { sessionId: 's2' }), {
+check('route get other session', (await request('GET', '/get?sessionId=s2')).json, {
   ok: true,
   value: { sessionId: 's2', active: false },
 });
-check('rpc ping', (await rpcHandler('ping', {})).ok, true);
+check('route ping', (await request('GET', '')).json.ok, true);
+check('route rejects GET for set', (await request('GET', '/set?sessionId=s1')).status, 405);
+check('route rejects a broken body', (await request('POST', '/set', '{oops')).status, 400);
+check('route unknown endpoint', (await request('GET', '/nope')).json.ok, false);
 
 check('armed: read allowed', call('read', 's1'), undefined);
 check('armed: grep allowed', call('grep', 's1'), undefined);
@@ -122,14 +148,13 @@ check('denied via session.header.id fallback', typeof guard(execWithoutAgent), '
 const execWithSessionId = { name: 'write', arguments: {}, sessionId: 's1' };
 check('denied via sessionId fallback', typeof guard(execWithSessionId), 'string');
 
-check('rpc set off', await rpcHandler('set', { sessionId: 's1', active: false }), {
+check('route set off', (await request('POST', '/set', { sessionId: 's1', active: false })).json, {
   ok: true,
   value: { sessionId: 's1', active: false },
 });
 check('disarmed: write allowed again', call('write', 's1'), undefined);
-check('rpc bad payload', (await rpcHandler('set', { sessionId: 's1' })).ok, false);
-check('rpc unknown endpoint', (await rpcHandler('nope', { sessionId: 's1' })).ok, false);
-check('rpc list', await rpcHandler('list', {}), { ok: true, value: { sessions: [] } });
+check('route bad payload', (await request('POST', '/set', { sessionId: 's1' })).json.ok, false);
+check('route list', (await request('GET', '/list')).json, { ok: true, value: { sessions: [] } });
 
 const cmd = commands[0];
 const run = (rawInput) => cmd.handler({ rawInput, agent: { session: { header: { id: 's9' } } } });
@@ -164,11 +189,7 @@ check('client module id', clientDef?.id, '@local/dsh-readonly-mode');
 
 /** Minimal hook runtime: hook slots persist across renders, effects flush on demand. */
 function makeReactRuntime() {
-  const runtime = {
-    cursor: 0,
-    values: [],
-    effects: [],
-  };
+  const runtime = { cursor: 0, values: [], effects: [] };
   runtime.api = {
     createElement(type, props, ...children) {
       return { type, props: props ?? {}, children };
@@ -196,12 +217,14 @@ function makeReactRuntime() {
 }
 
 /** Mount the client half against a fake context and return what it registered. */
-async function mountClient(get, extra = {}) {
+function mountClient(extra = {}) {
   const registered = [];
   const localeRegistered = [];
   const ctx = {
     ...extra,
-    get,
+    get() {
+      return undefined;
+    },
     effect(fn) {
       return fn();
     },
@@ -233,22 +256,25 @@ async function mountClient(get, extra = {}) {
   return { module, registered, localeRegistered, runtime };
 }
 
-/* --- scenario A: only the package RPC channel answers --- */
-const rpcCalls = [];
-const scenarioA = await mountClient((name) =>
-  name === 'connection'
-    ? {
-        rpc: {
-          async call(channel, endpoint, payload) {
-            rpcCalls.push([channel, endpoint, payload]);
-            return { ok: true, value: { sessionId: payload.sessionId, active: endpoint === 'get' } };
-          },
-        },
-      }
-    : undefined,
-);
+/** Fake `fetch` that records calls and answers with the plugin's own envelope. */
+function installFetch(answer) {
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push([url, init]);
+    const value = answer(url, init);
+    return { status: 200, async text() { return JSON.stringify(value); } };
+  };
+  return calls;
+}
 
-check('client inject list', scenarioA.module.inject, ['slots', 'locale', 'remote.commands']);
+/* --- scenario A: the route answers over fetch --- */
+const fetchCalls = installFetch((url) => {
+  const sessionId = decodeURIComponent(String(url).split('sessionId=')[1] ?? '');
+  return { ok: true, value: { sessionId, active: sessionId === 's1' } };
+});
+
+const scenarioA = mountClient();
+check('client inject list', scenarioA.module.inject, ['slots', 'locale']);
 check('locale namespace', scenarioA.localeRegistered, [['readonly-mode', ['zh', 'en']]]);
 check('style tagged', styleNodes[0].dataset.plugin, 'dsh-readonly-mode');
 check('slot name', scenarioA.registered[0].options.name, 'conversation.input.right');
@@ -262,52 +288,60 @@ const elementA = scenarioA.runtime.render(toggleA, { sessionId: 's1' });
 check('button element type', elementA.type, 'button');
 check('button starts disabled while loading', elementA.props.disabled, true);
 scenarioA.runtime.flush();
-await new Promise((resolve) => setTimeout(resolve, 0));
-check('rpc get used on mount', rpcCalls[0], [host.CHANNEL, 'get', { sessionId: 's1' }]);
+await tick();
+check('route get used on mount', fetchCalls[0][0], '/dsh-readonly-mode/get?sessionId=s1');
 check('state settled to on', scenarioA.runtime.values[0], true);
 check('phase settled to ready', scenarioA.runtime.values[1], 'ready');
 
-scenarioA.runtime.render(toggleA, {});
+// Switching to another session must read that session, not inherit the previous state.
+scenarioA.runtime.render(toggleA, { sessionId: 's2' });
 scenarioA.runtime.flush();
+const duringSwitch = scenarioA.runtime.values[0];
+scenarioA.runtime.flush();
+await tick();
+check('other session is not armed', scenarioA.runtime.values[0], false);
+check('other session was re-read', fetchCalls[1][0], '/dsh-readonly-mode/get?sessionId=s2');
+check('state is not inherited while loading', duringSwitch === null || duringSwitch === false, true);
+
 const noSession = scenarioA.runtime.render(toggleA, {});
+scenarioA.runtime.flush();
 check('button rendered without a session id too', noSession.type, 'button');
 check('without a session id it is not armed', noSession.props['data-readonly-mode'], 'off');
 
-/* --- scenario B: no RPC channel; `remote.commands` (the injected shape) answers --- */
-const commandCalls = [];
-const scenarioB = await mountClient(() => undefined, {
-  remote: {
-    commands: {
-      async execute(sessionId, line) {
-        commandCalls.push([sessionId, line]);
-        const on = line !== '/readonly off';
-        return { ok: true, value: { kind: 'success', text: on ? '已开启。readonly=on' : '已关闭。readonly=off' } };
-      },
-    },
-  },
+/* --- scenario B: the click writes through the route --- */
+const writeCalls = installFetch((url, init) => {
+  if (String(url).endsWith('/set')) {
+    const body = JSON.parse(init.body);
+    return { ok: true, value: { sessionId: body.sessionId, active: body.active } };
+  }
+  return { ok: true, value: { sessionId: 's7', active: true } };
 });
 
+const scenarioB = mountClient();
 const toggleB = scenarioB.registered[0].component;
 const elementB = scenarioB.runtime.render(toggleB, { sessionId: 's7' });
-check('fallback: button visible', elementB.type, 'button');
+check('scenario B: button visible', elementB.type, 'button');
 scenarioB.runtime.flush();
-await new Promise((resolve) => setTimeout(resolve, 0));
-check('fallback read used the command', commandCalls[0], ['s7', '/readonly status']);
-check('fallback parsed on', scenarioB.runtime.values[0], true);
+await tick();
+check('scenario B read on', scenarioB.runtime.values[0], true);
 
-// A second render is what React does after the state update; its click closure
-// then sees the settled phase instead of the initial "loading".
 const elementB2 = scenarioB.runtime.render(toggleB, { sessionId: 's7' });
 check('settled button is enabled', elementB2.props.disabled, false);
 elementB2.props.onClick();
-await new Promise((resolve) => setTimeout(resolve, 0));
-check('fallback write used the command', commandCalls[1], ['s7', '/readonly off']);
+await tick();
+check('write went to /set', String(writeCalls[1][0]), '/dsh-readonly-mode/set');
+check('write posts the session and the new state', JSON.parse(writeCalls[1][1].body), {
+  sessionId: 's7',
+  active: false,
+});
+check('state flipped to off', scenarioB.runtime.values[0], false);
 
 /* --- scenario C: no transport at all --- */
-const scenarioC = await mountClient(() => undefined);
+delete globalThis.fetch;
+const scenarioC = mountClient();
 const elementC = scenarioC.runtime.render(scenarioC.registered[0].component, { sessionId: 's3' });
 scenarioC.runtime.flush();
-await new Promise((resolve) => setTimeout(resolve, 0));
+await tick();
 check('no transport still renders', elementC.type, 'button');
 check('no transport lands in error', scenarioC.runtime.values[1], 'error');
 
